@@ -1,10 +1,14 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { scoringApi, modelsApi } from '../api/client';
 import { LogOut, UploadCloud, Database, Download, CheckCircle2, Trash2, AlertCircle, Loader, File as FileIcon, Target, Activity, X, BrainCircuit } from 'lucide-react';
 
+const INVESTOR_MODE_ENABLED = import.meta.env.VITE_ENABLE_MERGE_INSPECTOR === 'true';
+const MERGE_INSPECTOR_STORAGE_KEY = 'lucida_merge_inspector_enabled';
+
 export default function Dashboard() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -31,6 +35,9 @@ export default function Dashboard() {
   const [outcomeColumn, setOutcomeColumn] = useState('');
   const [feedbackWeight, setFeedbackWeight] = useState(2);
   const [autoRetrainEnabled, setAutoRetrainEnabled] = useState(true);
+  const [mergePreviewData, setMergePreviewData] = useState(null);
+  const [mergePreviewLoading, setMergePreviewLoading] = useState(false);
+  const [mergeInspectorEnabled, setMergeInspectorEnabled] = useState(INVESTOR_MODE_ENABLED);
 
   // Registry State
   const [modelsArchive, setModelsArchive] = useState([]);
@@ -62,6 +69,26 @@ export default function Dashboard() {
     });
     setLoading(false);
   }, [navigate]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const inspectorFlag = params.get('mergeInspector');
+
+    if (inspectorFlag === '1') {
+      localStorage.setItem(MERGE_INSPECTOR_STORAGE_KEY, 'true');
+      setMergeInspectorEnabled(true);
+      return;
+    }
+
+    if (inspectorFlag === '0') {
+      localStorage.removeItem(MERGE_INSPECTOR_STORAGE_KEY);
+      setMergeInspectorEnabled(INVESTOR_MODE_ENABLED);
+      return;
+    }
+
+    const stored = localStorage.getItem(MERGE_INSPECTOR_STORAGE_KEY) === 'true';
+    setMergeInspectorEnabled(INVESTOR_MODE_ENABLED || stored);
+  }, [location.search]);
 
   useEffect(() => {
     if (activeTab === 'models') {
@@ -109,6 +136,7 @@ export default function Dashboard() {
     setActiveTab(tab);
     setError(null);
     setFiles([]);
+    setMergePreviewData(null);
   };
 
   const handleDrop = (e) => {
@@ -153,6 +181,25 @@ export default function Dashboard() {
       setError(backendErr || detailErr || err.message || "An unexpected anomaly occurred.");
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  const inspectMergePlan = async () => {
+    if (files.length === 0) {
+      setError("Please stage at least one CSV payload.");
+      return;
+    }
+    setMergePreviewLoading(true);
+    setError(null);
+    try {
+      const resp = await scoringApi.mergePlan(files);
+      setMergePreviewData(resp.data);
+    } catch (err) {
+      const backendErr = err.response?.data?.error?.message;
+      const detailErr = err.response?.data?.detail;
+      setError(backendErr || detailErr || err.message || "Merge inspection failed.");
+    } finally {
+      setMergePreviewLoading(false);
     }
   };
 
@@ -435,7 +482,89 @@ export default function Dashboard() {
               <button onClick={executePipeline} disabled={actionLoading || files.length === 0} className="btn-primary w-full flex justify-center items-center py-4 text-sm tracking-widest">
                 {actionLoading ? <Loader className="w-5 h-5 animate-spin" /> : 'EXECUTE TRAINING SEQUENCE'}
               </button>
+
+              {mergeInspectorEnabled && (
+                <div className="mt-4 border border-line bg-black/40 p-4">
+                  <div className="flex items-center justify-between gap-4 flex-wrap">
+                    <div>
+                      <div className="font-mono text-[0.55rem] tracking-[0.2em] uppercase text-accent mb-1">Investor Inspector</div>
+                      <p className="text-xs text-dim">Optional relationship audit for demos and investor walkthroughs. Hidden in normal customer mode.</p>
+                    </div>
+                    <button
+                      onClick={inspectMergePlan}
+                      disabled={mergePreviewLoading || files.length === 0}
+                      className="btn-outline px-5 py-2 text-[0.6rem]"
+                    >
+                      {mergePreviewLoading ? 'INSPECTING...' : 'INSPECT MERGE PLAN'}
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
+
+            {mergeInspectorEnabled && mergePreviewData && (
+              <div className="glass-card p-8 border border-line bg-surface/20 fade-in">
+                <div className="flex justify-between items-center mb-6 gap-4 flex-wrap">
+                  <div>
+                    <h3 className="font-serif text-2xl font-light">Dataset Relationship Audit</h3>
+                    <p className="text-dim text-sm mt-2">This panel is for demos only. Training still remains a single-step action for sales users.</p>
+                  </div>
+                  <div className="font-mono text-[0.6rem] tracking-[0.18em] uppercase text-accent">
+                    {mergePreviewData.merge_plan?.strategy || 'analysis'}
+                  </div>
+                </div>
+
+                {mergePreviewData.merge_plan?.warnings?.length > 0 && (
+                  <div className="mb-6 border border-amber-500/30 bg-amber-500/10 p-4">
+                    <div className="font-mono text-[0.55rem] tracking-[0.18em] uppercase text-amber-300 mb-2">Warnings</div>
+                    <div className="space-y-2 text-sm text-amber-100">
+                      {mergePreviewData.merge_plan.warnings.map((warning) => (
+                        <p key={warning}>{warning}</p>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid md:grid-cols-3 gap-4 mb-6">
+                  <div className="p-4 bg-black border border-line">
+                    <div className="font-mono text-[0.55rem] tracking-[0.18em] uppercase text-dim mb-2">Base Dataset</div>
+                    <div className="text-sm text-white">{mergePreviewData.merge_plan?.base_dataset || 'n/a'}</div>
+                  </div>
+                  <div className="p-4 bg-black border border-line">
+                    <div className="font-mono text-[0.55rem] tracking-[0.18em] uppercase text-dim mb-2">Result Rows</div>
+                    <div className="text-sm text-white">{mergePreviewData.merge_plan?.result_shape?.rows ?? 'n/a'}</div>
+                  </div>
+                  <div className="p-4 bg-black border border-line">
+                    <div className="font-mono text-[0.55rem] tracking-[0.18em] uppercase text-dim mb-2">Result Columns</div>
+                    <div className="text-sm text-white">{mergePreviewData.merge_plan?.result_shape?.columns ?? 'n/a'}</div>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  {(mergePreviewData.merge_plan?.executed_steps || []).length === 0 && (
+                    <p className="text-sm text-dim">No safe merge steps were executed for this upload set.</p>
+                  )}
+                  {(mergePreviewData.merge_plan?.executed_steps || []).map((step) => (
+                    <div key={`${step.dataset}-${step.left_column}-${step.right_column}`} className="border border-line bg-black p-4">
+                      <div className="flex justify-between items-center gap-4 flex-wrap">
+                        <div>
+                          <div className="text-sm text-white">{step.dataset}</div>
+                          <div className="text-xs text-dim mt-1">
+                            {step.left_column} → {step.right_column}
+                          </div>
+                        </div>
+                        <div className="flex gap-2 flex-wrap">
+                          <span className="tag text-[0.5rem] tracking-widest">{step.strategy}</span>
+                          <span className="tag text-[0.5rem] tracking-widest">{step.join_shape}</span>
+                          <span className="tag text-[0.5rem] tracking-widest">confidence {Math.round((step.confidence || 0) * 100)}%</span>
+                          <span className="tag text-[0.5rem] tracking-widest">coverage {Math.round((step.coverage || 0) * 100)}%</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Train Results */}
             {trainingData && (

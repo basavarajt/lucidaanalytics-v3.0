@@ -16,12 +16,19 @@ from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, reca
 
 from app.database import get_db
 from app.core.auth import get_current_user
+from app.core.config import get_settings
 from app.core.responses import success_response, error_response
 from app.services import model_storage
+from app.services.dataset_relationships import (
+    DatasetAsset,
+    analyze_dataset_collection,
+    prepare_combined_dataset,
+)
 from app.services.explanation_translator import translate_scoring_results
 from adaptive_scorer import UniversalAdaptiveScorer, DataAnalyzer, EngagementScorer, ActionRecommender
 
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 router = APIRouter(tags=["Scoring"])
 
@@ -94,7 +101,8 @@ def smart_merge_dfs(dfs: List[pd.DataFrame]) -> pd.DataFrame:
 
 # ── Input Validation ─────────────────────────────────────────
 
-MAX_CSV_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_CSV_SIZE_MB = settings.MAX_CSV_SIZE_MB
+MAX_CSV_SIZE = MAX_CSV_SIZE_MB * 1024 * 1024
 MAX_COLUMNS = 500
 
 
@@ -123,7 +131,9 @@ async def _validate_and_read_files(
 
         # Validate file size
         if len(contents) > MAX_CSV_SIZE:
-            raise ValueError(f"File '{filename}' exceeds 50MB limit ({len(contents) / 1024 / 1024:.1f}MB)")
+            raise ValueError(
+                f"File '{filename}' exceeds {MAX_CSV_SIZE_MB}MB limit ({len(contents) / 1024 / 1024:.1f}MB)"
+            )
 
         df = pd.read_csv(io.BytesIO(contents))
 
@@ -134,6 +144,29 @@ async def _validate_and_read_files(
         dfs.append(df)
 
     return dfs
+
+
+def _uploaded_dataset_names(
+    file: Optional[UploadFile],
+    files: Optional[List[UploadFile]],
+) -> List[str]:
+    uploaded = []
+    if file:
+        uploaded.append(file)
+    if files:
+        uploaded.extend(files)
+
+    names = []
+    for index, uploaded_file in enumerate(uploaded, start=1):
+        names.append(uploaded_file.filename or f"dataset_{index}.csv")
+    return names
+
+
+def _prepare_assets(dataset_names: List[str], dfs: List[pd.DataFrame]) -> List[DatasetAsset]:
+    return [
+        DatasetAsset(name=name, df=df)
+        for name, df in zip(dataset_names, dfs)
+    ]
 
 
 # ── Background task: persist scored leads ────────────────────
@@ -169,6 +202,32 @@ def _persist_scores(tenant_id: str, model_name: str, results: list):
         logger.info("Persisted %d scored leads for tenant=%s", len(results), tenant_id)
     except Exception as e:
         logger.error("Failed to persist scores: %s", str(e))
+
+
+@router.post("/merge-plan")
+async def merge_plan(
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(get_current_user),
+):
+    """Profile uploaded datasets and recommend safe relationship-aware merge steps."""
+    try:
+        dataset_names = _uploaded_dataset_names(file, files)
+        dfs = await _validate_and_read_files(file, files)
+        assets = _prepare_assets(dataset_names, dfs)
+        analysis = analyze_dataset_collection(assets)
+        _, plan = prepare_combined_dataset(assets)
+
+        return success_response(data={
+            "status": "success",
+            "analysis": analysis,
+            "merge_plan": plan,
+        })
+    except ValueError as e:
+        return error_response("VALIDATION_ERROR", str(e), 400)
+    except Exception as e:
+        logger.exception("Merge planning failed")
+        return error_response("MERGE_PLAN_FAILED", f"Merge planning failed: {str(e)}", 500)
 
 
 def _get_model_version_history(tenant_id: str, model_name: str, limit: int = 2):
@@ -611,12 +670,21 @@ async def train_model(
     """
     tenant_id = user["tenant_id"]
     try:
+        dataset_names = _uploaded_dataset_names(file, files)
         dfs = await _validate_and_read_files(file, files)
+        assets = _prepare_assets(dataset_names, dfs)
 
         logger.info("Training: tenant=%s model=%s mode=%s files=%d", tenant_id, model_name, mode, len(dfs))
 
-        df = smart_merge_dfs(dfs)
-        logger.info("Merged data shape: %s", df.shape)
+        df, merge_plan = prepare_combined_dataset(assets)
+        logger.info("Prepared data shape: %s using strategy=%s", df.shape, merge_plan.get("strategy"))
+
+        if len(assets) > 1 and not merge_plan.get("executed_steps") and merge_plan.get("warnings"):
+            return error_response(
+                "NO_SAFE_MERGE_PLAN",
+                "No safe dataset relationship was found. Review merge-plan results or upload datasets with stronger keys.",
+                400,
+            )
 
         if df.shape[0] < 10:
             return error_response("TOO_FEW_ROWS", f"Need at least 10 rows, got {df.shape[0]}", 400)
@@ -684,6 +752,7 @@ async def train_model(
                       (" - UNSUPERVISED RANKING (no target needed)" if mode == "unsupervised" else ""),
             "analysis": train_result["analysis"],
             "metrics": train_result["metrics"],
+            "merge_plan": merge_plan,
         })
 
     except ValueError as e:
@@ -719,9 +788,11 @@ async def score_csv(
         return error_response("MODEL_NOT_FOUND", f"No model '{model_name}' found. Train first.", 404)
 
     try:
+        dataset_names = _uploaded_dataset_names(file, files)
         dfs = await _validate_and_read_files(file, files)
+        assets = _prepare_assets(dataset_names, dfs)
 
-        df = smart_merge_dfs(dfs)
+        df, merge_plan = prepare_combined_dataset(assets)
         results = _route_and_score_rows(tenant_id, model_name, scorer, df)
         rank_tracking = _compare_against_previous_version(tenant_id, model_name, df, results)
 
@@ -794,6 +865,7 @@ async def score_csv(
             "n_leads": len(enriched_results),
             "results": enriched_results,
             "rank_tracking": rank_tracking,
+            "merge_plan": merge_plan,
             "routing_summary": {
                 "base_model": model_name,
                 "segment_routed_rows": routed_count,

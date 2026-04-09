@@ -29,6 +29,16 @@ export const authApi = {
 };
 
 export const scoringApi = {
+  mergePlan: async (files) => {
+    const formData = new FormData();
+    files.forEach((f) => formData.append('files', f));
+
+    const response = await client.post('/merge-plan', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  },
+
   train: async (modelName, files, targetCol = null, mode = "supervised") => {
     const formData = new FormData();
     files.forEach((f) => formData.append('files', f));

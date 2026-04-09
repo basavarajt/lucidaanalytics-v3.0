@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     # ── ML ───────────────────────────────────────────────────
     MODEL_ARTIFACTS_DIR: str = "./model_artifacts"
+    MAX_CSV_SIZE_MB: int = 200
 
     @property
     def cors_origins_list(self) -> List[str]:
